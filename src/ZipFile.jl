@@ -38,6 +38,8 @@ module ZipFile
 
 import Base: read, read!, eof, write, flush, close, mtime, position, show, unsafe_write
 using Printf
+using TranscodingStreams
+import CodecZlib
 
 export read, read!, eof, write, close, mtime, position, show
 
@@ -201,14 +203,10 @@ end
 include("deprecated.jl")
 include("iojunk.jl")
 
-if isdefined(Core, :String) && isdefined(Core, :AbstractString)
-    function utf8_validate(vec::Vector{UInt8})
-        s = String(vec)
-        isvalid(s) || throw(ArgumentError("Invalid utf8 string: $vec"))
-        return s
-    end
-else
-    utf8_validate(vec::Vector{UInt8}) = utf8(vec)
+function utf8_validate(vec::Vector{UInt8})
+    s = String(vec)
+    isvalid(s) || throw(ArgumentError("Invalid utf8 string: $vec"))
+    return s
 end
 
 readle(io::IO, ::Type{UInt64}) = htol(read(io, UInt64))
@@ -225,6 +223,7 @@ end
 
 _writele(io::IO, x::UInt16) = _writele(io, Vector{UInt8}(reinterpret(UInt8, [htol(x)])))
 _writele(io::IO, x::UInt32) = _writele(io, Vector{UInt8}(reinterpret(UInt8, [htol(x)])))
+_writele(io::IO, x::UInt64) = _writele(io, Vector{UInt8}(reinterpret(UInt8, [htol(x)])))
 
 # For MS-DOS time/date format, see:
 # http://msdn.microsoft.com/en-us/library/ms724247(v=VS.85).aspx
@@ -465,9 +464,10 @@ function close(f::WritableFile)
     end
     f._closed = true
 
-    if f.method == Deflate
-        close(f._zio)
-    end
+    # clean up codec without closing wrapped IO
+    write(f._zio, TranscodingStreams.TOKEN_END)
+    TranscodingStreams.finalize(f._zio.codec)
+    
     f.compressedsize = position(f)
 
     # fill in local file header fillers
@@ -504,9 +504,9 @@ function ensure_zio!(f::ReadableFile)
     extralen = readle(f._io, UInt16)
     skip(f._io, filelen+extralen)
     if f.method == Deflate
-        f._zio = Zlib.Reader(f._io, true)
+        f._zio = TranscodingStream(CodecZlib.DeflateDecompressor(), f._io)
     elseif f.method == Store
-        f._zio = f._io
+        f._zio = TranscodingStream(Noop(), f._io)
     end
     f._datapos = position(f._io)
 end
@@ -525,9 +525,7 @@ function update_reader!(f::ReadableFile, data::Array{UInt8})
     end
 
     if eof(f)
-        if f.method == Deflate
-            close(f._zio)
-        end
+        TranscodingStreams.finalize(f._zio.codec)
         if  f._currentcrc32 != f.crc32
             error("crc32 do not match")
         end
@@ -636,7 +634,9 @@ function addfile(w::Writer, name::AbstractString; method::Integer=Store, mtime::
 
     f._datapos = position(w._io)
     if f.method == Deflate
-        f._zio = Zlib.Writer(f._io, true)
+        f._zio = TranscodingStream(CodecZlib.DeflateCompressor(;level=9), f._io)
+    elseif f.method == Store
+        f._zio = TranscodingStream(Noop(), f._io)
     end
     w.files = [w.files; f]
     w._current = f
@@ -669,17 +669,20 @@ Base.readavailable(io::ZipFile.ReadableFile) = read(io)
 
 # Write nb elements located at p into f.
 function unsafe_write(f::WritableFile, p::Ptr{UInt8}, nb::UInt)
-    # zlib doesn't like 0 length writes
-    if nb == 0
-        return 0
-    end
-
     n = unsafe_write(f._zio, p, nb)
     if n != nb
         error("short write")
     end
 
-    f.crc32 = Zlib.crc32(unsafe_wrap(Array, p, nb), f.crc32)
+    chunk_size = if Sys.WORD_SIZE > 32 2^31 else datalen end 
+    offset = 0
+    datalen = nb
+    while datalen > 0
+        sub_chunk_size = min(chunk_size, datalen)
+        f.crc32 = Zlib.crc32(unsafe_wrap(Array, p+offset, sub_chunk_size), f.crc32)
+        datalen -= sub_chunk_size
+        offset += sub_chunk_size
+    end
     f.uncompressedsize += n
     n
 end
